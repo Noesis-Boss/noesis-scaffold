@@ -49,9 +49,15 @@ git remote get-url origin >/dev/null 2>&1 \
 
 # 3. Pages in Actions mode. Must exist before the workflow runs, or
 #    deploy-pages fails with "Resource not accessible by integration".
-gh api -X POST "repos/$SLUG/pages" -f build_type=workflow >/dev/null 2>&1 \
-  || gh api -X PUT "repos/$SLUG/pages" -f build_type=workflow >/dev/null 2>&1 \
-  || true
+#    POST creates, PUT updates an existing Pages config; either is fine. Don't
+#    swallow a double failure silently — it resurfaces later as an opaque
+#    deploy-pages error, so say so here where the cause is obvious.
+if ! gh api -X POST "repos/$SLUG/pages" -f build_type=workflow >/dev/null 2>&1 \
+   && ! gh api -X PUT "repos/$SLUG/pages" -f build_type=workflow >/dev/null 2>&1; then
+  echo "warning: could not set Pages to Actions mode on $SLUG." >&2
+  echo "         If deploy-pages fails with 'Resource not accessible by" >&2
+  echo "         integration', set Settings > Pages > Source = GitHub Actions." >&2
+fi
 
 # 4. Push -> Actions deploys.
 git push -u origin main
@@ -69,15 +75,23 @@ for _ in $(seq 1 30); do
   sleep 4
 done
 
-# Re-running on an unchanged tree pushes nothing, so no new run exists.
-# Dispatch one rather than silently skipping verification.
+# No run for HEAD at all (e.g. Actions was disabled on the first push).
+# Dispatch one rather than silently skipping verification. A dispatched run
+# can't be found by commit, so remember the newest run id first and wait for a
+# *different* one — polling `--limit 1` alone would grab a pre-existing run for
+# some other commit and report its result as ours.
 if [[ -z "$RUN_ID" ]]; then
   echo "no run for HEAD; dispatching deploy.yml"
+  PREV_RUN_ID="$(gh run list --repo "$SLUG" --workflow deploy.yml --limit 1 \
+    --json databaseId --jq '.[0].databaseId // empty')"
   gh workflow run deploy.yml --repo "$SLUG" --ref main
   for _ in $(seq 1 30); do
-    RUN_ID="$(gh run list --repo "$SLUG" --workflow deploy.yml --limit 1 \
+    CANDIDATE="$(gh run list --repo "$SLUG" --workflow deploy.yml --limit 1 \
       --json databaseId --jq '.[0].databaseId // empty')"
-    [[ -n "$RUN_ID" ]] && break
+    if [[ -n "$CANDIDATE" && "$CANDIDATE" != "$PREV_RUN_ID" ]]; then
+      RUN_ID="$CANDIDATE"
+      break
+    fi
     sleep 4
   done
 fi
